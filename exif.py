@@ -4,10 +4,16 @@ import argparse
 import os
 import re
 import sys
+import json
 import time
 from datetime import datetime
 
 import exifread
+# import pyheif
+
+
+class NoTimestampInsideFileMetadata(RuntimeError):
+    pass
 
 
 def progress(message):
@@ -19,8 +25,10 @@ class File:
 
     @classmethod
     def factory(cls, path, debug=False):
-        if re.match(r'.*\.(jpg|jpeg)', os.path.basename(path), re.IGNORECASE):
+        if re.match(r'.*\.(jpg|jpeg)$', os.path.basename(path), re.IGNORECASE):
             return FileSupportingExif(path, debug)
+        # if re.match(r'.*\.(heic)$', os.path.basename(path), re.IGNORECASE):
+        #     return HeicFile(path, debug)
         else:
             return cls(path, debug)
 
@@ -38,7 +46,7 @@ class File:
         os.utime(self.path, (timestamp, timestamp))
 
     def metadata_mtime_timestamp(self):
-        raise RuntimeError(f"UNRECOGNIZED TYPE")
+        raise RuntimeWarning(f"UNRECOGNIZED TYPE")
 
 
 class FileSupportingExif(File):
@@ -49,9 +57,14 @@ class FileSupportingExif(File):
     def exif_mtime_timestamp(self):
         tags = self.get_exif_data(self.path)
         if 'EXIF DateTimeOriginal' not in tags:
-            raise RuntimeError("EXIF DateTimeOriginal missing from JPEG")
+            print(f"WARNING: {self.path}: EXIF DateTimeOriginal missing from JPEG")
+            return None
+        try:
+            mtime_datetime = datetime.strptime(str(tags['EXIF DateTimeOriginal']), '%Y:%m:%d %H:%M:%S')
+        except ValueError as e:
+            print(f"WARNING: {self.path}: {str(e)}")
+            return None
 
-        mtime_datetime = datetime.strptime(str(tags['EXIF DateTimeOriginal']), '%Y:%m:%d %H:%M:%S')
         return time.mktime(mtime_datetime.timetuple())
 
     def get_exif_data(self, file_path):
@@ -65,46 +78,74 @@ class FileSupportingExif(File):
             return tags
 
 
+# class HeicFile(File):
+#     def metadata_mtime_timestamp(self):
+#         x = pyheif.read_heif(self.path)
+#         print(x.metadata)
+#         import pdb ; pdb.set_trace()
+#         raise RuntimeError("not done yet")
+
+
 class ExifFixer:
 
-    def __init__(self, fix, dump):
+    def __init__(self, fix, dump, verbose):
         self.fix = fix
         self.dump = dump
+        self.verbose = verbose
 
     def walk_tree(self, basepath):
         for dirName, subdirList, fileList in os.walk(basepath):
-            progress(f'Found directory: {dirName}\n')
+            if self.verbose:
+                progress(f'Found directory: {dirName}\n')
             for fname in fileList:
-                progress(f"\t{fname}: ")
                 file_path = os.path.join(dirName, fname)
                 file = File.factory(file_path, self.dump)
                 try:
                     self.check_file(file)
+                except RuntimeWarning as w:
+                    if self.verbose:
+                        print("WARNING: " + str(w))
                 except RuntimeError as e:
-                    print(str(e))
+                    print("ERROR: " + str(e))
 
     def check_file(self, file):
-        metadata_mtime = file.metadata_mtime_timestamp()
         file_mtime_timestamp = os.path.getmtime(file.path)
+        metadata_mtime = file.metadata_mtime_timestamp() or self.google_takeout_json_timestamp(file)
+        if metadata_mtime is None:
+            raise RuntimeError(f"no metadata source date for {file.path}")
 
-        progress(f"{file.path}\t{metadata_mtime}\t{file_mtime_timestamp}")
+        commentary = f"\t{file.path}\t{metadata_mtime}\t{file_mtime_timestamp}"
+
         if metadata_mtime == file_mtime_timestamp:
-            progress("\tSAME\n")
+            if self.verbose:
+                progress(f"{commentary}\tSAME\n")
         else:
             if self.fix:
-                progress(f"\tUPDATED\n")
+                progress(f"{commentary}\tUPDATED\n")
                 file.set_mtime(metadata_mtime)
             else:
-                progress("\tDIFFERENT\n")
+                progress(f"{commentary}\tDIFFERENT\n")
+
+    def google_takeout_json_timestamp(self, file):
+        # Google Takeout manouver
+        # See if there is a .json file with the data we need
+        json_file_path = file.path + ".json"
+        if os.path.isfile(json_file_path):
+            with open(json_file_path, 'r') as file:
+                data = json.load(file)
+                return int(data['photoTakenTime']['timestamp'])
+        else:
+            return None
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-f', '--fix', action='store_true', help="change file mtime to match Exif mtime")
 parser.add_argument('-d', '--dump', action='store_true', help="dump metadata")
+parser.add_argument('-v', '--verbose', action='store_true', help="more details")
 parser.add_argument('files_and_dirs', type=str, nargs='+')
 args = vars(parser.parse_args())
 
-fixer = ExifFixer(args['fix'], args['dump'])
+fixer = ExifFixer(args['fix'], args['dump'], args['verbose'])
 for path in args['files_and_dirs']:
     if os.path.isdir(path):
         fixer.walk_tree(path)
